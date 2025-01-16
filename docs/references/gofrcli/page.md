@@ -95,6 +95,7 @@ gofr wrap grpc -proto=<path_to_the_proto_file>
    It's a quick way to verify which version of the GoFr CLI you have.
 
 ### Command Usage 
+
 ```go
 gofr version
 ```
