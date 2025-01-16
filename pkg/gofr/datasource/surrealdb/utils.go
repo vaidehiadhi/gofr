@@ -1,44 +1,47 @@
 package surrealdb
 
 import (
-	"context"
 	"fmt"
 	"io"
 	"regexp"
 	"strings"
+
+	"go.opentelemetry.io/otel/trace"
 )
 
-type Logger interface {
-	Debugf(pattern string, args ...interface{})
-	Debug(args ...interface{})
-	Logf(pattern string, args ...interface{})
-	Errorf(pattern string, args ...interface{})
-}
+var rgx = regexp.MustCompile(`\s+`)
 
-type Metrics interface {
-	NewCounter(name, desc string)
-	NewUpDownCounter(name, desc string)
-	NewHistogram(name, desc string, buckets ...float64)
-	NewGauge(name, desc string)
+// Clean takes a string query as input and performs two operations to clean it up:
+// 1. It replaces multiple consecutive whitespace characters with a single space.
+// 2. It trims leading and trailing whitespace from the string.
+// The cleaned-up query string is then returned.
+func clean(query string) string {
+	// Replace multiple consecutive whitespace characters with a single space
+	query = rgx.ReplaceAllString(query, " ")
 
-	IncrementCounter(ctx context.Context, name string, labels ...string)
-	DeltaUpDownCounter(ctx context.Context, name string, value float64, labels ...string)
-	RecordHistogram(ctx context.Context, name string, value float64, labels ...string)
-	SetGauge(name string, value float64, labels ...string)
+	// Trim leading and trailing whitespace from the string
+	query = strings.TrimSpace(query)
+
+	return query
 }
 
 type QueryLog struct {
-	Query      string      `json:"query"`
-	Duration   int64       `json:"duration"`
-	Namespace  string      `json:"namespace"`
-	Database   string      `json:"database"`
-	ID         interface{} `json:"id"`
-	Data       interface{} `json:"data"`
-	Filter     interface{} `json:"filter,omitempty"`
-	Update     interface{} `json:"update,omitempty"`
-	Collection string      `json:"collection,omitempty"`
+	Query         string      `json:"query"`                // The query executed.
+	OperationName string      `json:"operationName"`        // The operation name
+	Duration      int64       `json:"duration"`             // Execution time in microseconds.
+	Namespace     string      `json:"namespace"`            // The namespace of the query.
+	Database      string      `json:"database"`             // The database the query was executed on.
+	ID            interface{} `json:"id"`                   // The ID of the affected items.
+	Data          interface{} `json:"data"`                 // The data affected or retrieved.
+	Filter        interface{} `json:"filter,omitempty"`     // Optional filter applied to the query.
+	Update        interface{} `json:"update,omitempty"`     // Optional update data for the query.
+	Collection    string      `json:"collection,omitempty"` // Optional collection affected.\
+	Span          trace.Span  `json:"span,omitempty"`       // Optional tracing span associated with the query.
 }
 
+const defaultValue = "default"
+
+// PrettyPrint outputs a formatted string representation of the QueryLog.
 func (ql *QueryLog) PrettyPrint(writer io.Writer) {
 	if ql.Filter == nil {
 		ql.Filter = ""
@@ -52,21 +55,19 @@ func (ql *QueryLog) PrettyPrint(writer io.Writer) {
 		ql.Update = ""
 	}
 
-	fmt.Fprintf(writer, "\u001B[38;5;8m%-32s \u001B[38;5;206m%-6s\u001B[0m %8d\u001B[38;5;8mµs\u001B[0m %s\n",
-		clean(ql.Query), "SURREAL", ql.Duration,
-		clean(strings.Join([]string{ql.Collection, fmt.Sprint(ql.Filter), fmt.Sprint(ql.ID), fmt.Sprint(ql.Update)}, " ")))
-}
+	if ql.Database == "" {
+		ql.Database = defaultValue
+	}
 
-// clean takes a string query as input and performs two operations to clean it up:
-// 1. It replaces multiple consecutive whitespace characters with a single space.
-// 2. It trims leading and trailing whitespace from the string.
-// The cleaned-up query string is then returned.
-func clean(query string) string {
-	// Replace multiple consecutive whitespace characters with a single space
-	query = regexp.MustCompile(`\s+`).ReplaceAllString(query, " ")
+	if ql.Namespace == "" {
+		ql.Namespace = defaultValue
+	}
 
-	// Trim leading and trailing whitespace from the string
-	query = strings.TrimSpace(query)
-
-	return query
+	fmt.Fprintf(writer, "\u001B[38;5;206m%-15s\u001B[0m %-6s %8d\u001B[38;5;8mµs\u001B[0m \u001B[38;5;8m%s:%s\u001B[0m %s\n",
+		ql.OperationName,
+		"SURREAL",
+		ql.Duration,
+		ql.Database, ql.Namespace,
+		clean(ql.Query),
+	)
 }
