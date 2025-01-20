@@ -9,7 +9,7 @@ For example, instead of manually setting up a new project structure, GoFr CLI ca
 ---
 
 # **Prerequisite**
-- Go 1.21 or above. To check Go version use the following command
+- Go 1.22 or above. To check Go version use the following command
 ```bash
   go version.
 ````
@@ -40,8 +40,7 @@ gofr <subcommand> [flags]=[arguments]
 
 1. **`init`**
 
-   The init command initializes a new GoFr project. The init command sets up the foundational structure for a new GoFr project.
-   It generates a simple "Hello World!" program as a starting point, allowing developers to quickly dive into building their application.
+   The init command initializes a new GoFr project. It sets up the foundational structure for the project and generates a basic "Hello World!" program as a starting point. This allows developers to quickly dive into building their application with a ready-made framework structure.
 
 ### Command Usage
 ```go
@@ -75,11 +74,37 @@ For detailed instructions on handling database migrations, see the [handling-dat
 
 ### Command Usage
 ```go
-gofr wrap grpc -proto=<path_to_the_proto_file>
+gofr wrap grpc server --proto=<path_to_the_proto_file>
 ```
 ### Generated Files
 - ```{serviceName}_gofr.go (auto-generated; do not modify)```
 - ```{serviceName}_server.go (example structure below)```
+- ```{serviceName}_client.go (auto-generated; do not modify)```
+
+### Example Usage:
+After generating the {serviceName}_client.go file, you can register and access the gRPC service as follows:
+
+```go
+func main() {
+    app := gofr.New()
+
+    // Create a gRPC client for the Hello service
+    helloGRPCClient, err := {clientPackage}.NewHelloGoFrClient(app.Config.Get("GRPC_SERVER_HOST"))
+    if err != nil {
+        app.Logger().Errorf("Failed to create Hello gRPC client: %v", err)
+        return
+    }
+
+    greetHandler := NewGreetHandler(helloGRPCClient)
+
+    // Register HTTP endpoint for Hello service
+    app.GET("/hello", greetHandler.Hello)
+
+    // Run the application
+    app.Run()
+}
+
+```
 
 ### Benefits
 - **Streamlined gRPC Integration**: Automatically generates necessary files according to your protofiles to quickly set up gRPC services in your GoFr project.
