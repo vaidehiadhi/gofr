@@ -9,13 +9,18 @@ import (
 	"time"
 
 	"go.opentelemetry.io/otel/trace"
-
 	"golang.org/x/time/rate"
 )
 
+const (
+	shutdownTimeout = 100 * time.Millisecond
+)
+
 var (
-	ErrQueueFull    = errors.New("request queue is full")
-	ErrShuttingDown = errors.New("rate limiter is shutting down")
+	ErrQueueFull      = errors.New("request queue is full")
+	ErrShuttingDown   = errors.New("rate limiter is shutting down")
+	ErrPanicRecovered = errors.New("panic recovered in request processing")
+	ErrShutdownFailed = errors.New("shutdown timeout")
 )
 
 type RateLimiterConfig struct {
@@ -71,12 +76,33 @@ func NewRateLimiter(limit int, window time.Duration, maxQueue int) *RateLimiter 
 	return rl
 }
 
+func handleContextDeadline(ctx context.Context) (context.Context, context.CancelFunc) {
+	if _, ok := ctx.Deadline(); !ok {
+		span := trace.SpanFromContext(ctx)
+		spanContext := span.SpanContext()
+		traceID := spanContext.TraceID().String()
+		spanID := spanContext.SpanID().String()
+
+		newCtx := context.Background()
+		if spanContext.IsValid() {
+			newCtx = trace.ContextWithSpanContext(newCtx, spanContext)
+
+			fmt.Printf("Request with TraceID: %s, SpanID: %s\n", traceID, spanID)
+		}
+
+		return context.WithCancel(newCtx)
+	}
+
+	return context.WithCancel(ctx)
+}
+
 func (r *RateLimiter) Shutdown(ctx context.Context) error {
 	r.mutex.Lock()
 	if r.isShuttingDown {
 		r.mutex.Unlock()
 		return ErrShuttingDown
 	}
+
 	r.isShuttingDown = true
 	r.mutex.Unlock()
 
@@ -93,37 +119,55 @@ func (r *RateLimiter) Shutdown(ctx context.Context) error {
 		select {
 		case <-completed:
 			return nil
-		case <-time.After(100 * time.Millisecond):
-			return fmt.Errorf("shutdown timeout: %v", ctx.Err())
+		case <-time.After(shutdownTimeout):
+			return fmt.Errorf("%w: %w", ErrShutdownFailed, ctx.Err())
 		}
 	case <-completed:
 		return nil
 	}
 }
 
-func (r *RateLimiter) enqueueRequest(ctx context.Context, execute func() (*http.Response, error)) (*http.Response, error) {
-	if _, ok := ctx.Deadline(); !ok {
-		span := trace.SpanFromContext(ctx)
-		spanContext := span.SpanContext()
-		traceID := spanContext.TraceID().String()
-		spanID := spanContext.SpanID().String()
+func (r *RateLimiter) handleResponse(ctx context.Context, respCh chan *requestResponse,
+	reqCancel context.CancelFunc) (*http.Response, error) {
+	select {
+	case resp := <-respCh:
+		reqCancel()
 
-		newCtx := context.Background()
-		if spanContext.IsValid() {
-			newCtx = trace.ContextWithSpanContext(newCtx, spanContext)
-			fmt.Printf("Request with TraceID: %s, SpanID: %s\n", traceID, spanID)
+		if resp.err != nil {
+			span := trace.SpanFromContext(ctx)
+			traceID := span.SpanContext().TraceID().String()
+
+			return nil, fmt.Errorf("request failed for TraceID %s: %w", traceID, resp.err)
 		}
 
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithCancel(newCtx)
-		defer cancel()
+		return resp.response, resp.err
+	case <-ctx.Done():
+		reqCancel()
+
+		span := trace.SpanFromContext(ctx)
+		traceID := span.SpanContext().TraceID().String()
+
+		return nil, fmt.Errorf("context canceled while waiting for request with TraceID %s: %w", traceID, ctx.Err())
+	case <-r.done:
+		reqCancel()
+
+		span := trace.SpanFromContext(ctx)
+		traceID := span.SpanContext().TraceID().String()
+
+		return nil, fmt.Errorf("rate limiter shutting down while waiting for request with TraceID %s: %w", traceID, ErrShuttingDown)
 	}
+}
+
+func (r *RateLimiter) enqueueRequest(ctx context.Context, execute func() (*http.Response, error)) (*http.Response, error) {
+	ctx, cancel := handleContextDeadline(ctx)
+	defer cancel()
 
 	r.mutex.Lock()
 	if r.isShuttingDown {
 		span := trace.SpanFromContext(ctx)
 		traceID := span.SpanContext().TraceID().String()
 		r.mutex.Unlock()
+
 		return nil, fmt.Errorf("rate limiter shutting down for request with TraceID %s: %w", traceID, ErrShuttingDown)
 	}
 
@@ -132,19 +176,21 @@ func (r *RateLimiter) enqueueRequest(ctx context.Context, execute func() (*http.
 		span := trace.SpanFromContext(ctx)
 		traceID := span.SpanContext().TraceID().String()
 		r.mutex.Unlock()
+
 		return nil, fmt.Errorf("%w for request with TraceID %s (max size: %d)", ErrQueueFull, traceID, r.maxQueue)
 	}
 	r.mutex.Unlock()
 
 	respCh := make(chan *requestResponse, 1)
-	reqCtx, cancel := context.WithCancel(ctx)
+	reqCtx, reqCancel := context.WithCancel(ctx)
 
 	r.wg.Add(1)
+
 	req := requestWrapper{
 		execute: execute,
 		respCh:  respCh,
 		ctx:     reqCtx,
-		cancel:  cancel,
+		cancel:  reqCancel,
 	}
 
 	select {
@@ -154,39 +200,26 @@ func (r *RateLimiter) enqueueRequest(ctx context.Context, execute func() (*http.
 			traceID := span.SpanContext().TraceID().String()
 			fmt.Printf("Request queued with TraceID: %s. Queue length: %d\n", traceID, queueLen)
 		}
-	case <-ctx.Done():
-		r.wg.Done()
-		cancel()
-		span := trace.SpanFromContext(ctx)
-		traceID := span.SpanContext().TraceID().String()
-		return nil, fmt.Errorf("context cancelled while enqueueing for request with TraceID %s: %w", traceID, ctx.Err())
-	case <-r.done:
-		r.wg.Done()
-		cancel()
-		span := trace.SpanFromContext(ctx)
-		traceID := span.SpanContext().TraceID().String()
-		return nil, fmt.Errorf("rate limiter shutting down for request with TraceID %s: %w", traceID, ErrShuttingDown)
-	}
 
-	select {
-	case resp := <-respCh:
-		cancel()
-		if resp.err != nil {
-			span := trace.SpanFromContext(ctx)
-			traceID := span.SpanContext().TraceID().String()
-			return nil, fmt.Errorf("request failed for TraceID %s: %w", traceID, resp.err)
-		}
-		return resp.response, resp.err
+		return r.handleResponse(ctx, respCh, reqCancel)
+
 	case <-ctx.Done():
-		cancel()
+		r.wg.Done()
+		reqCancel()
+
 		span := trace.SpanFromContext(ctx)
 		traceID := span.SpanContext().TraceID().String()
-		return nil, fmt.Errorf("context cancelled while waiting for request with TraceID %s: %w", traceID, ctx.Err())
+
+		return nil, fmt.Errorf("context canceled while enqueueing for request with TraceID %s: %w", traceID, ctx.Err())
+
 	case <-r.done:
-		cancel()
+		r.wg.Done()
+		reqCancel()
+
 		span := trace.SpanFromContext(ctx)
 		traceID := span.SpanContext().TraceID().String()
-		return nil, fmt.Errorf("rate limiter shutting down while waiting for request with TraceID %s: %w", traceID, ErrShuttingDown)
+
+		return nil, fmt.Errorf("rate limiter shutting down for request with TraceID %s: %w", traceID, ErrShuttingDown)
 	}
 }
 
@@ -220,16 +253,17 @@ func (r *RateLimiter) processRequest(req requestWrapper) {
 		if rec := recover(); rec != nil {
 			req.respCh <- &requestResponse{
 				response: nil,
-				err:      fmt.Errorf("panic recovered: %v", rec),
+				err:      fmt.Errorf("%w: %v", ErrPanicRecovered, rec),
 			}
 		}
+
 		r.wg.Done()
 		req.cancel()
 	}()
 
 	select {
 	case <-req.ctx.Done():
-		req.respCh <- &requestResponse{nil, fmt.Errorf("request cancelled in queue: %w", req.ctx.Err())}
+		req.respCh <- &requestResponse{nil, fmt.Errorf("request canceled in queue: %w", req.ctx.Err())}
 		return
 	default:
 	}
@@ -244,6 +278,11 @@ func (r *RateLimiter) processRequest(req requestWrapper) {
 		req.respCh <- &requestResponse{nil, fmt.Errorf("request execution error: %w", err)}
 		return
 	}
+
+	if resp != nil && resp.Body != nil {
+		resp.Body.Close()
+	}
+
 	req.respCh <- &requestResponse{resp, nil}
 }
 

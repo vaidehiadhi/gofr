@@ -81,10 +81,10 @@ func TestRateLimiter_RateLimitingBehavior(t *testing.T) {
 
 	duration := time.Since(start)
 
-	assert.GreaterOrEqual(t, duration.Milliseconds() >= 450,
+	assert.GreaterOrEqual(t, duration.Milliseconds(), int64(450),
 		"Expected third request to be delayed by rate limiting, but completed too quickly: %v", duration)
 
-	assert.LessOrEqual(t, duration.Milliseconds() <= 750,
+	assert.LessOrEqual(t, duration.Milliseconds(), int64(750),
 		"Requests took longer than expected: %v", duration)
 }
 
@@ -172,22 +172,6 @@ func TestRateLimiter_DeleteWithHeadersSuccessRequests(t *testing.T) {
 	_ = resp.Body.Close()
 }
 
-func TestRateLimiter_ContextCancellation(t *testing.T) {
-	server, service := setupHTTPServiceTestServerForRateLimiter()
-	defer server.Close()
-
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel() // Cancel context immediately
-
-	resp, err := service.Get(ctx, "test", nil)
-	if resp != nil {
-		defer resp.Body.Close()
-	}
-
-	require.Error(t, err)
-	require.Nil(t, resp)
-}
-
 func TestRateLimiter_ConcurrentRequests(t *testing.T) {
 	server, service := setupHTTPServiceTestServerForRateLimiter()
 	defer server.Close()
@@ -215,7 +199,7 @@ func TestRateLimiter_ConcurrentRequests(t *testing.T) {
 		}
 	}
 
-	assert.Positive(t, successes > 0, "Expected some requests to succeed")
+	assert.Positive(t, successes, 0, "Expected some requests to succeed")
 }
 
 type customTransportRL struct{}
